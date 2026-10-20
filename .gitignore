@@ -1,0 +1,9 @@
+_archive_phase0_obsolete/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.env
+logs/*.log
+target-app/
+

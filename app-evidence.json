@@ -1,0 +1,14 @@
+{
+  "error": "JavaScript application analysis failed",
+  "code": "artifact_operation_failed",
+  "category": "execution_failure",
+  "message": "Artifact could not be read or written. Check file access and try again.",
+  "retryable": false,
+  "remediation": {
+    "action": "Artifact could not be read or written. Check file access and try again."
+  },
+  "details": {
+    "operation": "analyze_javascript_application",
+    "reason": "io"
+  }
+}
