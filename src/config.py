@@ -53,6 +53,7 @@ class SystemConfig:
     atr_multiplier_for_stop: float = float(os.getenv('ATR_MULTIPLIER_FOR_STOP', 1.5))
     atr_multiplier_for_trail: float = float(os.getenv('ATR_MULTIPLIER_FOR_TRAIL', 3.0))
     account_balance: float = float(os.getenv('ACCOUNT_BALANCE', 100000.0))
+    ACCOUNT_BALANCE_USD: float = float(os.getenv('ACCOUNT_BALANCE_USD', 100.0))
 
     RISK_PER_TRADE_PERCENT: float = float(os.getenv('RISK_PER_TRADE_PERCENT', 0.01))
     ATR_MULTIPLIER_FOR_STOP: float = float(os.getenv('ATR_MULTIPLIER_FOR_STOP', 1.5))
@@ -69,3 +70,5 @@ MACRO_TIMEFRAME = os.getenv('MACRO_TIMEFRAME', '4h')
 RISK_PER_TRADE_PERCENT = float(os.getenv('RISK_PER_TRADE_PERCENT', 0.01))
 ATR_MULTIPLIER_FOR_STOP = float(os.getenv('ATR_MULTIPLIER_FOR_STOP', 1.5))
 ATR_MULTIPLIER_FOR_TRAIL = float(os.getenv('ATR_MULTIPLIER_FOR_TRAIL', 3.0))
+ACCOUNT_BALANCE_USD = float(os.getenv('ACCOUNT_BALANCE_USD', 100.0))
+

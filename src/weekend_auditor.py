@@ -436,9 +436,10 @@ class WeekendAuditor:
 
         # Print massive warning if strategy has negative expectancy
         if has_neg_exp:
-            print("\n" + "=" * 60)
+            print("\n" + "=" * 70)
+            print("🚨 STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT DEPLOY LIVE CAPITAL.")
             print("STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.")
-            print("=" * 60 + "\n")
+            print("=" * 70 + "\n")
 
         lines = [
             f"# Weekend Audit Report: {date_str}",
@@ -451,7 +452,8 @@ class WeekendAuditor:
         if has_neg_exp:
             lines.extend([
                 "> [!CAUTION]",
-                "> ## 🚨 STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.",
+                "> ## 🚨 STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT DEPLOY LIVE CAPITAL.",
+                "> **STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.**",
                 f"> **Net Expectancy**: `{expectancy_str}`. Mathematical expectation is negative after friction and win/loss payoff ratios.",
                 "",
             ])
@@ -542,6 +544,7 @@ class WeekendAuditor:
         print(f"Win Rate: {stats.get('win_rate_display', stats.get('win_rate'))}")
         print(f"Net Expectancy: {stats.get('expectancy_str', 'N/A')}")
         if stats.get("has_negative_expectancy"):
+            print("🚨 STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT DEPLOY LIVE CAPITAL.")
             print("STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.")
 
         report_path = self.generate_report(stats, missed_trades, bad_trades, as_of_date=now_dt)

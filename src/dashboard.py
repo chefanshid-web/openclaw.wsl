@@ -30,6 +30,16 @@ try:
 except ImportError:
     MacroFetcher = None
 
+try:
+    from src import config
+except ImportError:
+    config = None
+
+try:
+    from src.backtest.metrics import calculate_expectancy
+except ImportError:
+    calculate_expectancy = None
+
 # -----------------------------------------------------------------------------
 # Streamlit Page Config (Must be first Streamlit call)
 # Task 2: Use st.set_page_config(layout="wide") at the top
@@ -669,7 +679,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📡 Scanner & Scores",
     "📜 Factory Ledger",
     "🔬 R&D and Research",
-    "🎯 Calibration",
+    "🎯 Expectancy & Calibration",
 ])
 
 # =============================================================================
@@ -1068,15 +1078,18 @@ with tab5:
         st.info("No `library_active.md` found in repository root.")
 
 # =============================================================================
-# TAB 6: Calibration
-# Task 3: Confluence Score (x-axis) vs Actual Outcome (y-axis: 1 for win, 0 for loss)
+# TAB 6: Expectancy & Calibration
+# Task 4: Add new tab "Expectancy & Calibration" (formerly "Calibration")
+# Display current Account Balance ($100) and Net Expectancy
+# Plot Confluence Score (x-axis) vs actual Outcome (1 for win, 0 for loss) using st.scatter_chart
 # =============================================================================
 with tab6:
-    st.subheader("🎯 Model Confluence Calibration")
+    st.subheader("🎯 Expectancy & Calibration")
     st.caption(
         "Empirical validation of Confluence Scores vs. Actual Realized Outcomes. "
         "Plots Confluence Score (x-axis) vs. Outcome (y-axis: 1 for win, 0 for loss) "
-        "to verify whether a score of 70 represents a statistically profitable edge or signal miscalibration."
+        "alongside Starting Capital Account Balance ($100) and Net Expectancy. "
+        'Calibration analysis verifies whether a score of 70 represents a statistically profitable edge.'
     )
 
     cal_trades = []
@@ -1187,8 +1200,12 @@ with tab6:
 
     df_cal = pd.DataFrame(cal_trades)
 
-    # Statistical Summary Metrics
+    # -------------------------------------------------------------------------
+    # Statistical Summary, Net Expectancy & Account Balance ($100)
+    # -------------------------------------------------------------------------
     total_evaluated = len(df_cal)
+    wins_df = df_cal[df_cal["Outcome"] == 1]
+    losses_df = df_cal[df_cal["Outcome"] == 0]
     high_conf = df_cal[df_cal["Confluence Score"] >= 70.0]
     low_conf = df_cal[df_cal["Confluence Score"] < 70.0]
 
@@ -1196,16 +1213,55 @@ with tab6:
     wr_low = (low_conf["Outcome"].mean() * 100.0) if len(low_conf) > 0 else 0.0
     overall_wr = (df_cal["Outcome"].mean() * 100.0) if total_evaluated > 0 else 0.0
 
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    # Account Balance ($100 Starting Capital)
+    account_balance_usd = 100.0
+    if config and hasattr(config, "ACCOUNT_BALANCE_USD"):
+        account_balance_usd = float(config.ACCOUNT_BALANCE_USD)
+    elif config and hasattr(config, "account_balance"):
+        account_balance_usd = float(getattr(config, "ACCOUNT_BALANCE_USD", 100.0))
+
+    # Net Expectancy Calculation:
+    # Expectancy = (Win_Rate * Avg_Win_USD) - (Loss_Rate * Avg_Loss_USD) - Avg_Costs_USD
+    avg_win_usd = float(wins_df["Realized PnL ($)"].mean()) if len(wins_df) > 0 else 0.0
+    avg_loss_usd = abs(float(losses_df["Realized PnL ($)"].mean())) if len(losses_df) > 0 else 0.0
+    avg_costs_usd = 0.50  # Average round-trip execution cost friction
+    loss_rate_pct = (len(losses_df) / total_evaluated * 100.0) if total_evaluated > 0 else 0.0
+
+    if calculate_expectancy:
+        net_expectancy = calculate_expectancy(
+            win_rate=overall_wr,
+            avg_win_usd=avg_win_usd,
+            loss_rate=loss_rate_pct,
+            avg_loss_usd=avg_loss_usd,
+            avg_costs_usd=avg_costs_usd,
+        )
+    else:
+        p_win = overall_wr / 100.0
+        p_loss = loss_rate_pct / 100.0
+        net_expectancy = (p_win * avg_win_usd) - (p_loss * avg_loss_usd) - avg_costs_usd
+
+    # Top Telemetry Cards in st.columns(5)
+    col_bal, col_exp, col_m1, col_m2, col_m3 = st.columns(5)
+    with col_bal:
+        st.metric(
+            label="Account Balance",
+            value=f"${account_balance_usd:.2f}",
+            delta="1% Risk ($1.00 / Trade)",
+        )
+    with col_exp:
+        exp_delta = "Positive Edge" if net_expectancy >= 0 else "Negative Expectancy"
+        st.metric(
+            label="Net Expectancy",
+            value=f"{net_expectancy:+.2f} USD",
+            delta=exp_delta,
+            delta_color="normal" if net_expectancy >= 0 else "inverse",
+        )
     with col_m1:
         st.metric("Executed Trades", total_evaluated)
     with col_m2:
         delta_high = f"{wr_high - overall_wr:+.1f}% vs baseline" if total_evaluated > 0 else "0.0%"
         st.metric("Score ≥ 70 Win Rate", f"{wr_high:.1f}%", delta=delta_high)
     with col_m3:
-        delta_low = f"{wr_low - overall_wr:+.1f}% vs baseline" if total_evaluated > 0 else "0.0%"
-        st.metric("Score < 70 Win Rate", f"{wr_low:.1f}%", delta=delta_low, delta_color="inverse")
-    with col_m4:
         is_well_calibrated = wr_high >= 60.0 and (wr_high > wr_low)
         st.metric(
             "Calibration Gate",
@@ -1214,65 +1270,21 @@ with tab6:
             delta_color="normal" if is_well_calibrated else "inverse",
         )
 
+    # Massive Warning if negative expectancy
+    if net_expectancy < 0:
+        st.error("🚨 STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT DEPLOY LIVE CAPITAL.")
+
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
     st.markdown("#### 📈 Confluence Score vs. Actual Outcome (1 = Win, 0 = Loss)")
 
-    # Render Scatter Chart
-    try:
-        import altair as alt
-
-        base_chart = (
-            alt.Chart(df_cal)
-            .mark_circle(size=120, opacity=0.85)
-            .encode(
-                x=alt.X(
-                    "Confluence Score:Q",
-                    title="Confluence Score (x-axis)",
-                    scale=alt.Scale(domain=[45, 100]),
-                ),
-                y=alt.Y(
-                    "Outcome:Q",
-                    title="Outcome (1 for Win, 0 for Loss)",
-                    scale=alt.Scale(domain=[-0.15, 1.15]),
-                    axis=alt.Axis(values=[0, 1]),
-                ),
-                color=alt.Color(
-                    "Outcome Label:N",
-                    scale=alt.Scale(
-                        domain=["Win (1)", "Loss (0)"],
-                        range=["#00FFAA", "#FF3366"],
-                    ),
-                    title="Outcome",
-                ),
-                tooltip=[
-                    "Symbol",
-                    "Confluence Score",
-                    "Outcome",
-                    "Outcome Label",
-                    "Realized PnL ($)",
-                ],
-            )
-            .properties(
-                height=320,
-            )
-            .interactive()
-        )
-
-        threshold_line = (
-            alt.Chart(pd.DataFrame({"threshold": [70.0]}))
-            .mark_rule(color="#FFD700", strokeDash=[6, 4], strokeWidth=2)
-            .encode(x="threshold:Q")
-        )
-
-        st.altair_chart(base_chart + threshold_line, use_container_width=True)
-    except Exception:
-        st.scatter_chart(
-            df_cal,
-            x="Confluence Score",
-            y="Outcome",
-            color="Outcome Label",
-            use_container_width=True,
-        )
+    # Plot the Confluence Score of executed trades vs. actual Outcome using st.scatter_chart
+    st.scatter_chart(
+        df_cal,
+        x="Confluence Score",
+        y="Outcome",
+        color="Outcome Label",
+        use_container_width=True,
+    )
 
     # Diagnostic calibration status alert
     if wr_high >= 60.0:

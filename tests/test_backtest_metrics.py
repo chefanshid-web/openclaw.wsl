@@ -118,8 +118,8 @@ class TestBacktestMetrics:
 
     def test_dashboard_calibration_tab_structure(self):
         """
-        Validates that src/dashboard.py includes the Calibration Tab and
-        chart elements.
+        Validates that src/dashboard.py includes the Expectancy & Calibration Tab,
+        Account Balance ($100), Net Expectancy, and chart elements.
         """
         from pathlib import Path
         dash_file = Path(__file__).resolve().parent.parent / "src" / "dashboard.py"
@@ -127,8 +127,59 @@ class TestBacktestMetrics:
         content = dash_file.read_text(encoding="utf-8")
 
         # Tab registration
-        assert '"🎯 Calibration"' in content or '"Calibration"' in content
+        assert any(k in content for k in ['"Expectancy & Calibration"', '"🎯 Expectancy & Calibration"', '"Calibration"'])
         # Confluence Score vs Outcome mapping
         assert "Confluence Score" in content
         assert "Outcome" in content
         assert "Score ≥ 70 Win Rate" in content
+        assert "Account Balance" in content
+        assert "Net Expectancy" in content
+        assert "st.scatter_chart" in content
+
+    def test_starting_capital_and_position_sizing_100usd(self):
+        """
+        Task 1: Validates starting capital of $100 in src/config.py
+        and that calculate_position_size uses 1% risk ($1.00 per trade).
+        """
+        from src import config
+        from src.paper_executor import calculate_position_size
+
+        assert hasattr(config, "ACCOUNT_BALANCE_USD")
+        assert config.ACCOUNT_BALANCE_USD == 100.0
+
+        # When account_balance is None, defaults to config.ACCOUNT_BALANCE_USD ($100.0)
+        # Entry = $100, Stop Loss = $90 -> Stop Distance = $10
+        # 1% risk on $100 balance = $1.00 risk budget
+        # Raw units = 1.00 / 10 = 0.10, fee adjusted = 0.10 * 0.98 = 0.098
+        # Total value = 0.098 * 100 = $9.80 (> $5.00 min order)
+        pos = calculate_position_size(
+            entry_price=100.0,
+            stop_loss=90.0,
+        )
+        assert pos.risk_amount == 1.0  # 1% of $100.0
+        assert pos.status == "VALID"
+        assert pos.is_rejected is False
+        assert pytest.approx(pos.units, 0.001) == 0.098
+        assert pytest.approx(pos.total_value, 0.01) == 9.80
+
+    def test_rejected_min_size_exchange_gate(self):
+        """
+        Task 1: If calculated position size is less than exchange minimum order size ($5 on Binance),
+        the trade is rejected and logged as REJECTED_MIN_SIZE.
+        """
+        from src.paper_executor import calculate_position_size
+
+        # Entry = $10.0, Stop = $8.0 -> Stop Distance = $2.0
+        # Risk Budget = 1.0 (on $100 balance)
+        # Raw units = 1.0 / 2.0 = 0.5, fee adjusted = 0.5 * 0.98 = 0.49
+        # Total value = 0.49 * 10.0 = $4.90 (< $5.00 Binance min order)
+        pos = calculate_position_size(
+            account_balance=100.0,
+            entry_price=10.0,
+            stop_loss=8.0,
+            min_order_usd=5.0,
+        )
+        assert pos.status == "REJECTED_MIN_SIZE"
+        assert pos.is_rejected is True
+        assert "below exchange minimum order size" in pos.rejection_reason
+        assert pos.total_value < 5.0

@@ -158,6 +158,9 @@ class PositionSizeResult(tuple):
         max_qty: Optional[float] = None,
         step_size: Optional[float] = None,
         contract_multiplier: float = 1.0,
+        status: str = "VALID",
+        is_rejected: bool = False,
+        rejection_reason: str = "",
     ):
         return super().__new__(cls, (units, total_value))
 
@@ -173,6 +176,9 @@ class PositionSizeResult(tuple):
         max_qty: Optional[float] = None,
         step_size: Optional[float] = None,
         contract_multiplier: float = 1.0,
+        status: str = "VALID",
+        is_rejected: bool = False,
+        rejection_reason: str = "",
     ):
         self.units = units
         self.total_value = total_value
@@ -184,6 +190,9 @@ class PositionSizeResult(tuple):
         self.max_qty = max_qty
         self.step_size = step_size
         self.contract_multiplier = contract_multiplier
+        self.status = status
+        self.is_rejected = is_rejected
+        self.rejection_reason = rejection_reason
 
     def __getitem__(self, item):
         if isinstance(item, str):
@@ -195,23 +204,32 @@ class PositionSizeResult(tuple):
 
 
 def calculate_position_size(
-    account_balance: float,
-    entry_price: float,
+    account_balance: Optional[float] = None,
+    entry_price: float = 0.0,
     stop_loss: Optional[float] = None,
     atr_value: Optional[float] = None,
     symbol: Optional[str] = None,
     exchange: Optional[Any] = None,
     contract_multiplier: Optional[float] = None,
+    min_order_usd: Optional[float] = None,
 ) -> PositionSizeResult:
     """
     Quant-Audited Dynamic Position Sizing Formula:
-    1. Risk_Budget = Account_Balance * 0.01 (1% risk)
-    2. Stop_Distance = abs(Entry_Price - Stop_Loss) (or atr_value * ATR_MULTIPLIER_FOR_STOP if stop_loss omitted)
-    3. Raw_Quantity = Risk_Budget / Stop_Distance
-    4. Fee_Adjusted_Quantity = Raw_Quantity * 0.98 (deduct 2% for fees/slippage buffer)
-    5. Fetch exchange market limits (min_qty, max_qty, step_size, contract_multiplier) via CCXT
-    6. Round quantity down to nearest step size, cap at max_qty, and enforce min_qty.
+    1. Account_Balance = ACCOUNT_BALANCE_USD (defaults to $100.00 from src/config.py)
+    2. Risk_Budget = Account_Balance * 0.01 (1% risk = $1.00 per trade on $100 balance)
+    3. Stop_Distance = abs(Entry_Price - Stop_Loss) (or atr_value * ATR_MULTIPLIER_FOR_STOP if stop_loss omitted)
+    4. Raw_Quantity = Risk_Budget / Stop_Distance
+    5. Fee_Adjusted_Quantity = Raw_Quantity * 0.98 (deduct 2% for fees/slippage buffer)
+    6. Fetch exchange market limits (min_qty, max_qty, step_size, contract_multiplier) via CCXT
+    7. Round quantity down to nearest step size, cap at max_qty, and enforce min_qty.
+    8. Exchange Minimum Order Size Gate: If calculated position value < min_order_usd (e.g., $5 on Binance),
+       the trade is rejected and marked as REJECTED_MIN_SIZE.
     """
+    if account_balance is None:
+        account_balance = float(getattr(config, "ACCOUNT_BALANCE_USD", getattr(config, "account_balance", 100.0)))
+    else:
+        account_balance = float(account_balance)
+
     risk_pct = getattr(config, "RISK_PER_TRADE_PERCENT", 0.01)
     risk_budget = account_balance * risk_pct
 
@@ -265,13 +283,38 @@ def calculate_position_size(
         except Exception:
             final_units = float(max_qty)
 
-    if min_qty is not None and final_units < min_qty:
-        logger.warning(
-            f"[POSITION SIZING] Quantity {final_units} is below exchange minimum lot size {min_qty} for {symbol}. Sizing to 0."
-        )
-        final_units = 0.0
-
     total_value = final_units * entry_price * c_multiplier
+
+    # Minimum order size determination (Binance default is $5.00 USD)
+    min_notional = min_order_usd if min_order_usd is not None else 5.0
+    if limits.get("min_cost") is not None:
+        try:
+            min_notional = max(min_notional, float(limits["min_cost"]))
+        except (ValueError, TypeError):
+            pass
+
+    status = "VALID"
+    is_rejected = False
+    rejection_reason = ""
+
+    # Enforce minimum lot size & exchange minimum notional ($5.00 on Binance)
+    if min_qty is not None and final_units < min_qty:
+        final_units = 0.0
+        total_value = 0.0
+        status = "REJECTED_MIN_SIZE"
+        is_rejected = True
+        rejection_reason = f"Quantity is below exchange minimum lot size ({min_qty})"
+        logger.warning(
+            f"[POSITION SIZING] REJECTED_MIN_SIZE: Quantity below exchange minimum lot size {min_qty} for {symbol}. Sizing to 0."
+        )
+    elif total_value < min_notional:
+        status = "REJECTED_MIN_SIZE"
+        is_rejected = True
+        rejection_reason = f"Position value (${total_value:.2f}) is below exchange minimum order size (${min_notional:.2f})"
+        logger.warning(
+            f"[POSITION SIZING] REJECTED_MIN_SIZE: Calculated position value (${total_value:.2f}) "
+            f"is less than exchange minimum order size (${min_notional:.2f}) for {symbol}. Trade rejected."
+        )
 
     return PositionSizeResult(
         units=final_units,
@@ -284,6 +327,9 @@ def calculate_position_size(
         max_qty=max_qty,
         step_size=step_size,
         contract_multiplier=c_multiplier,
+        status=status,
+        is_rejected=is_rejected,
+        rejection_reason=rejection_reason,
     )
 
 
@@ -326,6 +372,7 @@ class PaperExecutor:
         "MISSED",
         "REJECTED",
         "REJECTED_SCHEMA",
+        "REJECTED_MIN_SIZE",
         "CANCELLED",
     }
 
@@ -704,6 +751,26 @@ class PaperExecutor:
             symbol=symbol,
             exchange=exchange,
         )
+
+        # Exchange minimum order size gate
+        if pos_size.is_rejected or pos_size.status == "REJECTED_MIN_SIZE" or pos_size.units <= 0:
+            logger.warning(
+                f"[REJECTED_MIN_SIZE] Plan {plan_id} rejected. Calculated position value "
+                f"${pos_size.total_value:.2f} is below exchange minimum order size ($5.00)."
+            )
+            self.update_plan_status(
+                plan_id,
+                "REJECTED_MIN_SIZE",
+                {
+                    "rejected_at": now_iso,
+                    "reason": pos_size.rejection_reason or "Position size below exchange minimum order size ($5.00)",
+                    "calculated_units": pos_size.units,
+                    "position_value": pos_size.total_value,
+                    "account_balance": account_balance,
+                    "risk_amount": pos_size.risk_amount,
+                },
+            )
+            return False
 
         # Atomic database locking: .update({"status": "FILLED", ...}).eq("id", plan_id).eq("status", "TRIGGERED").execute()
         fill_extra_metadata = {
