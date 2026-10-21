@@ -36,6 +36,10 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from src.db_manager import SupabaseManager
+from src.backtest.metrics import (
+    calculate_bootstrap_confidence,
+    calculate_expectancy,
+)
 
 logger = logging.getLogger("WeekendAuditor")
 if not logger.handlers:
@@ -238,13 +242,17 @@ class WeekendAuditor:
         paper_fills: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
-        Calculates basic stats: Total Trades, Win Rate, Total PnL (if available),
-        Average Score of winners vs losers.
+        Calculates stats: Total Trades, Win Rate with 95% Bootstrap CI,
+        Net Expectancy, Total PnL, Average Score of winners vs losers.
         """
         total_trades = len(filled_plans) if filled_plans else len(paper_fills)
 
         winner_scores: List[float] = []
         loser_scores: List[float] = []
+        winner_pnls: List[float] = []
+        loser_pnls: List[float] = []
+        trade_returns: List[float] = []
+        costs_list: List[float] = []
         total_pnl: float = 0.0
         has_pnl_data: bool = False
 
@@ -263,29 +271,58 @@ class WeekendAuditor:
                 pnl = meta.get("pnl")
             outcome = str(meta.get("outcome") or "").upper()
 
+            # Cost / fee extraction
+            fee = meta.get("fee_cost")
+            if fee is None:
+                fee = meta.get("cost")
+            if fee is None:
+                fee = meta.get("fees")
+            if fee is None:
+                fee = plan.get("fee_cost")
+            if fee is None:
+                fee = plan.get("cost")
+            if fee is not None:
+                try:
+                    costs_list.append(abs(float(fee)))
+                except (ValueError, TypeError):
+                    pass
+
             if pnl is not None:
                 try:
                     pnl_num = float(pnl)
                     total_pnl += pnl_num
                     has_pnl_data = True
+                    trade_returns.append(pnl_num)
                     if pnl_num > 0:
+                        winner_pnls.append(pnl_num)
                         if score_val is not None:
                             winner_scores.append(score_val)
                     elif pnl_num < 0:
+                        loser_pnls.append(abs(pnl_num))
                         if score_val is not None:
                             loser_scores.append(score_val)
                 except (ValueError, TypeError):
                     pass
             elif outcome in ("WIN", "TAKE_PROFIT", "TP"):
+                trade_returns.append(1.0)
+                winner_pnls.append(1.0)
                 if score_val is not None:
                     winner_scores.append(score_val)
             elif outcome in ("LOSS", "STOP_LOSS", "SL"):
+                trade_returns.append(-1.0)
+                loser_pnls.append(1.0)
                 if score_val is not None:
                     loser_scores.append(score_val)
 
         closed_evaluated = len(winner_scores) + len(loser_scores)
+        win_count = len(winner_scores)
+        loss_count = len(loser_scores)
+
+        # Point estimates
+        win_rate_pct = (win_count / closed_evaluated * 100.0) if closed_evaluated > 0 else 0.0
+        loss_rate_pct = (loss_count / closed_evaluated * 100.0) if closed_evaluated > 0 else 0.0
         win_rate_str = (
-            f"{(len(winner_scores) / closed_evaluated * 100):.1f}%"
+            f"{win_rate_pct:.1f}%"
             if closed_evaluated > 0
             else "N/A (No closed trades with outcome)"
         )
@@ -305,9 +342,54 @@ class WeekendAuditor:
             else "N/A"
         )
 
+        # Task 1: Bootstrap Confidence Intervals
+        bootstrap_res: Optional[Dict[str, Any]] = None
+        win_rate_ci: Optional[Tuple[float, float]] = None
+        sharpe_ci: Optional[Tuple[float, float]] = None
+        if trade_returns:
+            bootstrap_res = calculate_bootstrap_confidence(trade_returns, n_bootstraps=1000)
+            win_rate_ci = bootstrap_res.get("win_rate_ci")
+            sharpe_ci = bootstrap_res.get("sharpe_ci")
+
+        if closed_evaluated > 0 and win_rate_ci:
+            win_rate_display = f"{win_rate_pct:.1f}% (95% CI: [{win_rate_ci[0]:.1f}%, {win_rate_ci[1]:.1f}%])"
+        else:
+            win_rate_display = win_rate_str
+
+        # Task 2: Net Expectancy calculation
+        # Expectancy = (Win_Rate * Avg_Win_USD) - (Loss_Rate * Avg_Loss_USD) - Avg_Costs_USD
+        avg_win_usd = (sum(winner_pnls) / len(winner_pnls)) if winner_pnls else 0.0
+        avg_loss_usd = (sum(loser_pnls) / len(loser_pnls)) if loser_pnls else 0.0
+        avg_costs_usd = (sum(costs_list) / len(costs_list)) if costs_list else 0.0
+
+        if closed_evaluated > 0:
+            expectancy = calculate_expectancy(
+                win_rate=win_rate_pct,
+                avg_win_usd=avg_win_usd,
+                loss_rate=loss_rate_pct,
+                avg_loss_usd=avg_loss_usd,
+                avg_costs_usd=avg_costs_usd,
+            )
+            expectancy_str = f"{expectancy:+.2f} USD"
+            has_negative_expectancy = expectancy < 0.0
+        else:
+            expectancy = None
+            expectancy_str = "N/A (No closed trades with outcome)"
+            has_negative_expectancy = False
+
         return {
             "total_trades": total_trades,
             "win_rate": win_rate_str,
+            "win_rate_display": win_rate_display,
+            "win_rate_ci": win_rate_ci,
+            "sharpe_ci": sharpe_ci,
+            "bootstrap_confidence": bootstrap_res,
+            "expectancy": expectancy,
+            "expectancy_str": expectancy_str,
+            "has_negative_expectancy": has_negative_expectancy,
+            "avg_win_usd": avg_win_usd,
+            "avg_loss_usd": avg_loss_usd,
+            "avg_costs_usd": avg_costs_usd,
             "total_pnl": total_pnl_str,
             "avg_winner_score": avg_winner_score_str,
             "avg_loser_score": avg_loser_score_str,
@@ -331,21 +413,60 @@ class WeekendAuditor:
         filename = f"weekend_audit_{date_str}.md"
         filepath = os.path.join(self.reports_dir, filename)
 
+        win_rate_rep = stats.get("win_rate_display")
+        if not win_rate_rep:
+            base_wr = stats.get("win_rate", "N/A")
+            ci = stats.get("win_rate_ci")
+            if ci and base_wr != "N/A" and "(95% CI:" not in str(base_wr):
+                win_rate_rep = f"{base_wr} (95% CI: [{ci[0]:.1f}%, {ci[1]:.1f}%])"
+            else:
+                win_rate_rep = base_wr
+
+        expectancy_val = stats.get("expectancy")
+        expectancy_str = stats.get("expectancy_str")
+        if expectancy_str is None:
+            if expectancy_val is not None:
+                expectancy_str = f"{expectancy_val:+.2f} USD"
+            else:
+                expectancy_str = "N/A"
+
+        has_neg_exp = stats.get("has_negative_expectancy", False)
+        if expectancy_val is not None and expectancy_val < 0.0:
+            has_neg_exp = True
+
+        # Print massive warning if strategy has negative expectancy
+        if has_neg_exp:
+            print("\n" + "=" * 60)
+            print("STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.")
+            print("=" * 60 + "\n")
+
         lines = [
             f"# Weekend Audit Report: {date_str}",
             "",
             f"- **Generated At**: {now_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}",
             f"- **Audit Period**: Last 7 Days ({(now_dt - timedelta(days=7)).strftime('%Y-%m-%d')} to {date_str})",
             "",
+        ]
+
+        if has_neg_exp:
+            lines.extend([
+                "> [!CAUTION]",
+                "> ## 🚨 STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.",
+                f"> **Net Expectancy**: `{expectancy_str}`. Mathematical expectation is negative after friction and win/loss payoff ratios.",
+                "",
+            ])
+
+        lines.extend([
             "## Weekly Stats",
             f"- **Total Trades**: {stats.get('total_trades', 0)}",
-            f"- **Win Rate**: {stats.get('win_rate', 'N/A')}",
+            f"- **Win Rate**: {win_rate_rep}",
+            f"- **Net Expectancy**: {expectancy_str}",
             f"- **Total PnL**: {stats.get('total_pnl', 'N/A')}",
             f"- **Average Score (Winners)**: {stats.get('avg_winner_score', 'N/A')}",
             f"- **Average Score (Losers)**: {stats.get('avg_loser_score', 'N/A')}",
             "",
             '## The "Missed Trades" (Score 60-69)',
-        ]
+        ])
 
         if missed_trades:
             lines.append(f"Total Near Misses: {len(missed_trades)}\n")
@@ -418,6 +539,10 @@ class WeekendAuditor:
         print(f"Near Misses (Score 60-69): {len(missed_trades)}")
         print(f"Bad Trades (Score > 70 Lost): {len(bad_trades)}")
         print(f"Total Trades Evaluated: {stats.get('total_trades', 0)}")
+        print(f"Win Rate: {stats.get('win_rate_display', stats.get('win_rate'))}")
+        print(f"Net Expectancy: {stats.get('expectancy_str', 'N/A')}")
+        if stats.get("has_negative_expectancy"):
+            print("STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE.")
 
         report_path = self.generate_report(stats, missed_trades, bad_trades, as_of_date=now_dt)
         print(f"Audit report generated: {report_path}")

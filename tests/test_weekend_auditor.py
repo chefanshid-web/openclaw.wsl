@@ -165,3 +165,58 @@ def test_probe_schema(caplog):
         auditor._probe_schema()
     assert "trade_plans keys:" in caplog.text
     assert "plan_metadata keys:" in caplog.text
+
+
+def test_calculate_stats_bootstrap_and_expectancy():
+    auditor = WeekendAuditor()
+    filled_plans = [
+        {"id": "1", "plan_metadata": {"confluence_score": 80.0, "realized_pnl": 100.0, "fee_cost": 5.0, "outcome": "WIN"}},
+        {"id": "2", "plan_metadata": {"confluence_score": 70.0, "realized_pnl": -50.0, "fee_cost": 5.0, "outcome": "LOSS"}},
+        {"id": "3", "plan_metadata": {"confluence_score": 90.0, "realized_pnl": 50.0, "fee_cost": 5.0, "outcome": "WIN"}},
+    ]
+    stats = auditor.calculate_stats(filled_plans, [])
+    assert stats["total_trades"] == 3
+    assert stats["win_rate"] == "66.7%"
+    assert "95% CI:" in stats["win_rate_display"]
+    assert stats["win_rate_ci"] is not None
+    # 5th percentile <= 95th percentile
+    assert stats["win_rate_ci"][0] <= stats["win_rate_ci"][1]
+    # Net Expectancy: (2/3 * 75.0) - (1/3 * 50.0) - 5.0 = 50.0 - 16.67 - 5.0 = +28.33 USD
+    assert stats["expectancy"] is not None
+    assert stats["expectancy"] > 0
+    assert stats["has_negative_expectancy"] is False
+    assert "USD" in stats["expectancy_str"]
+
+
+def test_generate_report_negative_expectancy_warning(tmp_path, capsys):
+    reports_dir = str(tmp_path / "reports")
+    auditor = WeekendAuditor(reports_dir=reports_dir)
+    sat_dt = datetime(2026, 10, 17, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Losing strategy: 20% win rate, avg win $30, avg loss $100, cost $5 -> Net Expectancy < 0
+    stats = {
+        "total_trades": 10,
+        "win_rate": "20.0%",
+        "win_rate_display": "20.0% (95% CI: [10.0%, 30.0%])",
+        "expectancy": -69.0,
+        "expectancy_str": "-69.00 USD",
+        "has_negative_expectancy": True,
+        "total_pnl": "-690.00 USDT",
+        "avg_winner_score": "75.0",
+        "avg_loser_score": "72.0",
+    }
+
+    report_path = auditor.generate_report(stats, [], [], as_of_date=sat_dt)
+    captured = capsys.readouterr()
+
+    # Verify massive warning was printed to console
+    assert "STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE." in captured.out
+
+    # Verify report contents
+    with open(report_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "**Win Rate**: 20.0% (95% CI: [10.0%, 30.0%])" in content
+    assert "**Net Expectancy**: -69.00 USD" in content
+    assert "STRATEGY HAS NEGATIVE EXPECTANCY. DO NOT TRADE." in content
+
