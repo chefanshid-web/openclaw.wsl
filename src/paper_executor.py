@@ -382,6 +382,21 @@ class PaperExecutor:
         self.running = True
         self._schema_probed = False
         self.adverse_selection_rate: float = self.ADVERSE_SELECTION_RATE
+        self.simulated_balance: float = float(
+            getattr(config, "ACCOUNT_BALANCE_USD", getattr(config, "account_balance", 100.0))
+        )
+
+    def _sync_balance_to_supabase(self, db: Optional[SupabaseManager]) -> None:
+        """Syncs simulated account balance to system_state table if available."""
+        if not db:
+            return
+        try:
+            db.client.table("system_state").update({
+                "account_balance": round(self.simulated_balance, 4),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", 1).execute()
+        except Exception:
+            pass
 
     def check_adverse_selection(self) -> bool:
         """Simulates adverse selection: 30% probability of immediate reversal upon touching entry."""
@@ -670,15 +685,16 @@ class PaperExecutor:
             )
             return False
 
-        # Task 5: Slippage Simulation for Honest Paper Fills (0.0% to 0.05%, max half a tick for Maker orders)
-        slippage = random.uniform(0, 0.0005)
+        # Task 2: Calculate entry_slippage = random.uniform(0, 0.001)
+        # fill_price = entry_price * (1 + entry_slippage) for LONG, (1 - entry_slippage) for SHORT
+        entry_slippage = random.uniform(0, 0.001)
         if fill_price is not None:
             exec_price = fill_price
         elif direction == "LONG":
-            fill_price = entry_price * (1.0 + slippage)
+            fill_price = entry_price * (1.0 + entry_slippage)
             exec_price = fill_price
         else:  # SHORT
-            fill_price = entry_price * (1.0 - slippage)
+            fill_price = entry_price * (1.0 - entry_slippage)
             exec_price = fill_price
         now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat()
@@ -772,14 +788,30 @@ class PaperExecutor:
             )
             return False
 
+        # Task 2 & 3: Mathematically Honest Friction (Fees & Slippage)
+        quantity = pos_size.units
+        maker_fee_pct = getattr(config, "MAKER_FEE_PCT", 0.0002)
+        taker_fee_pct = getattr(config, "TAKER_FEE_PCT", 0.0005)
+
+        # entry_fee = (fill_price * quantity) * MAKER_FEE_PCT
+        entry_fee = round((exec_price * quantity) * maker_fee_pct, 4)
+        entry_slippage_cost = round(abs(exec_price - entry_price) * quantity, 4)
+
+        # Deduct entry_fee from simulated balance
+        self.simulated_balance = round(self.simulated_balance - entry_fee, 4)
+        self._sync_balance_to_supabase(db)
+
         # Atomic database locking: .update({"status": "FILLED", ...}).eq("id", plan_id).eq("status", "TRIGGERED").execute()
         fill_extra_metadata = {
             "filled_at": now_iso,
             "fill_price": exec_price,
-            "slippage": slippage,
+            "entry_price": entry_price,
+            "entry_slippage": entry_slippage,
+            "slippage": entry_slippage,
             "order_type": "POST_ONLY_MAKER",
-            "maker_fee_bps": 2.0,
+            "maker_fee_bps": maker_fee_pct * 10000.0,
             "position_size": pos_size.units,
+            "quantity": pos_size.units,
             "position_units": pos_size.units,
             "position_value": pos_size.total_value,
             "risk_amount": pos_size.risk_amount,
@@ -787,7 +819,14 @@ class PaperExecutor:
             "fee_adjusted_quantity": pos_size.fee_adjusted_quantity,
             "step_size": pos_size.step_size,
             "contract_multiplier": pos_size.contract_multiplier,
-            "account_balance": account_balance,
+            "account_balance": round(self.simulated_balance, 4),
+            "maker_fee_pct": maker_fee_pct,
+            "taker_fee_pct": taker_fee_pct,
+            "entry_fee": round(entry_fee, 4),
+            "exit_fee": 0.0,
+            "gross_pnl": 0.0,
+            "slippage_cost": round(entry_slippage_cost, 4),
+            "net_pnl": round(-entry_fee, 4),
         }
 
         if not db:
@@ -839,14 +878,18 @@ class PaperExecutor:
             logger.error(f"Failed to atomically update plan {plan_id} to FILLED: {e}")
             return False
 
-        # Log PAPER_FILL signal audit record
+        # Log PAPER_FILL signal audit record with Task 3 fields:
+        # gross_pnl, entry_fee, exit_fee, slippage_cost, and net_pnl
         try:
             fill_metadata = {
                 "plan_id": plan_id,
                 "direction": direction,
+                "entry_price": entry_price,
                 "fill_price": exec_price,
-                "slippage": slippage,
+                "entry_slippage": entry_slippage,
+                "slippage": entry_slippage,
                 "position_size": pos_size.units,
+                "quantity": pos_size.units,
                 "position_value": pos_size.total_value,
                 "risk_amount": pos_size.risk_amount,
                 "raw_quantity": pos_size.raw_quantity,
@@ -858,6 +901,12 @@ class PaperExecutor:
                 "atr": atr_value,
                 "simulated_fill_time": now_iso,
                 "fill_source": "TRIGGER_POLLER",
+                "gross_pnl": 0.0,
+                "entry_fee": round(entry_fee, 4),
+                "exit_fee": 0.0,
+                "slippage_cost": round(entry_slippage_cost, 4),
+                "net_pnl": round(-entry_fee, 4),
+                "account_balance": round(self.simulated_balance, 4),
             }
             db.log_signal(
                 symbol=symbol,
@@ -937,69 +986,123 @@ class PaperExecutor:
     def close_trade(
         self,
         plan: Dict[str, Any],
-        exit_price: float,
+        exit_price: Optional[float] = None,
         exit_reason: str = "TRAILING_STOP"
     ) -> bool:
         """
-        Task 4: The Trailing Stop Monitor.
-        Closes a FILLED plan in database and logs a PAPER_EXIT signal.
+        Task 2 & 3: The Honest Fill Exit Logic.
+        Closes a FILLED plan in database, applies exit slippage and taker fee,
+        calculates gross_pnl, entry_fee, exit_fee, slippage_cost, and net_pnl,
+        deducts exit_fee from simulated balance, and logs a PAPER_EXIT signal.
         """
         plan_id = plan["id"]
         symbol = plan["symbol"]
         direction = plan.get("direction", "SHORT").upper()
         now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat()
-
-        logger.warning(
-            f"[POSITION CLOSED] Plan {plan_id[:8]}.. ({symbol} {direction}) exited at {exit_price:.2f}. "
-            f"Reason: {exit_reason}"
-        )
-
         meta = plan.get("plan_metadata") or {}
-        entry_price = float(plan.get("entry_price", 0.0) or meta.get("fill_price", 0.0))
+
+        stop_loss = float(plan.get("stop_loss", 0.0))
+        take_profit = float(plan.get("take_profit", 0.0))
+
+        # Task 2: When a position is closed (SL or TP), apply exit_slippage = random.uniform(0, 0.001)
+        # exit_price = stop_loss * (1 - exit_slippage) for LONG, (1 + exit_slippage) for SHORT
+        exit_slippage = random.uniform(0, 0.001)
+        if exit_price is None:
+            if "TAKE_PROFIT" in exit_reason.upper() and take_profit > 0:
+                actual_exit_price = take_profit * (1.0 - exit_slippage) if direction == "LONG" else take_profit * (1.0 + exit_slippage)
+            else:
+                base_stop = stop_loss if stop_loss > 0 else float(plan.get("entry_price", 0.0))
+                actual_exit_price = base_stop * (1.0 - exit_slippage) if direction == "LONG" else base_stop * (1.0 + exit_slippage)
+        else:
+            actual_exit_price = float(exit_price)
+
         pos_units = float(
             plan.get("position_size")
             or meta.get("position_size")
             or meta.get("position_units")
             or 1.0
         )
+        entry_fill_price = float(meta.get("fill_price") or plan.get("entry_price") or 0.0)
+        entry_intended_price = float(plan.get("entry_price") or entry_fill_price)
+
+        # Task 2 & 3: Mathematically Honest Friction
+        taker_fee_pct = getattr(config, "TAKER_FEE_PCT", 0.0005)
+        maker_fee_pct = getattr(config, "MAKER_FEE_PCT", 0.0002)
+
+        # exit_fee = (exit_price * quantity) * TAKER_FEE_PCT
+        exit_fee = (actual_exit_price * pos_units) * taker_fee_pct
+        entry_fee = float(meta.get("entry_fee", (entry_fill_price * pos_units) * maker_fee_pct))
+
+        # Deduct exit_fee from simulated balance
+        self.simulated_balance -= exit_fee
+
         if direction == "LONG":
-            gross_pnl = (exit_price - entry_price) * pos_units
+            gross_pnl = (actual_exit_price - entry_fill_price) * pos_units
         else:
-            gross_pnl = (entry_price - exit_price) * pos_units
+            gross_pnl = (entry_fill_price - actual_exit_price) * pos_units
 
-        # Estimated round-trip fees (0.04% maker/taker assumption)
-        fee_rate = 0.0004
-        fee_cost = (entry_price + exit_price) * pos_units * fee_rate
-        realized_pnl = round(gross_pnl - fee_cost, 4)
+        # Realize gross PnL on simulated balance
+        self.simulated_balance += gross_pnl
 
-        # 1. Update trade plan status to CLOSED
+        entry_slip_cost = float(meta.get("slippage_cost", abs(entry_fill_price - entry_intended_price) * pos_units))
+        exit_slip_cost = abs(actual_exit_price - stop_loss) * pos_units if stop_loss > 0 else 0.0
+        total_slippage_cost = round(entry_slip_cost + exit_slip_cost, 4)
+
+        # The net_pnl must be the ONLY number used for the account balance
+        net_pnl = round(gross_pnl - entry_fee - exit_fee, 4)
+        realized_pnl = net_pnl
+
+        db = self._ensure_db()
+        self._sync_balance_to_supabase(db)
+
+        logger.warning(
+            f"[POSITION CLOSED] Plan {plan_id[:8]}.. ({symbol} {direction}) exited at {actual_exit_price:.2f}. "
+            f"Reason: {exit_reason} | Net PnL: {net_pnl:+.2f} USD (Gross: {gross_pnl:+.2f}, Fees: {entry_fee + exit_fee:.2f})"
+        )
+
+        # 1. Update trade plan status to CLOSED with honest friction telemetry
         self.update_plan_status(
             plan_id,
             "CLOSED",
             {
                 "closed_at": now_iso,
-                "exit_price": exit_price,
+                "exit_price": actual_exit_price,
                 "exit_reason": exit_reason,
+                "exit_slippage": exit_slippage,
+                "gross_pnl": round(gross_pnl, 4),
+                "entry_fee": round(entry_fee, 4),
+                "exit_fee": round(exit_fee, 4),
+                "slippage_cost": total_slippage_cost,
+                "net_pnl": net_pnl,
                 "realized_pnl": realized_pnl,
+                "account_balance": round(self.simulated_balance, 4),
             }
         )
 
         # 2. Log PAPER_EXIT signal to Supabase signals table
-        db = self._ensure_db()
         if db:
             try:
                 exit_meta = {
                     "plan_id": plan_id,
                     "symbol": symbol,
                     "direction": direction,
-                    "entry_price": float(plan.get("entry_price", 0.0)),
-                    "exit_price": exit_price,
-                    "stop_loss": float(plan.get("stop_loss", 0.0)),
-                    "take_profit": float(plan.get("take_profit", 0.0)),
+                    "entry_price": entry_fill_price,
+                    "exit_price": actual_exit_price,
+                    "stop_loss": stop_loss,
+                    "take_profit": take_profit,
                     "exit_reason": exit_reason,
+                    "exit_slippage": exit_slippage,
                     "closed_at": now_iso,
-                    "realized_pnl": realized_pnl,
+                    "quantity": pos_units,
+                    "position_size": pos_units,
+                    "gross_pnl": round(gross_pnl, 4),
+                    "entry_fee": round(entry_fee, 4),
+                    "exit_fee": round(exit_fee, 4),
+                    "slippage_cost": total_slippage_cost,
+                    "net_pnl": net_pnl,
+                    "realized_pnl": net_pnl,
+                    "account_balance": round(self.simulated_balance, 4),
                 }
                 db.log_signal(
                     symbol=symbol,
@@ -1179,23 +1282,52 @@ class PaperExecutor:
             logger.warning(f"Unable to determine current price for plan {plan_id}")
             return None
 
-        # Task 4 Check: Has current price hit the trailing stop?
-        if direction == "LONG" and current_stop > 0 and current_price <= current_stop:
-            self.close_trade(plan, exit_price=current_price, exit_reason="TRAILING_STOP")
+        # Task 2: When a position is closed (SL or TP), apply exit_slippage = random.uniform(0, 0.001)
+        # exit_price = stop_loss * (1 - exit_slippage) for LONG, (1 + exit_slippage) for SHORT
+        exit_slippage = random.uniform(0, 0.001)
+        tp = float(plan.get("take_profit") or meta.get("take_profit") or 0.0)
+
+        # 1. Take Profit Check
+        if direction == "LONG" and tp > 0 and current_price >= tp:
+            sim_exit = tp * (1.0 - exit_slippage) if (current_price == tp or current_price is None) else current_price
+            self.close_trade(plan, exit_price=sim_exit, exit_reason="TAKE_PROFIT")
             return {
                 "plan_id": plan_id,
                 "symbol": symbol,
                 "closed": True,
-                "exit_price": current_price,
+                "exit_price": sim_exit,
+                "exit_reason": "TAKE_PROFIT",
+            }
+        elif direction == "SHORT" and tp > 0 and current_price <= tp:
+            sim_exit = tp * (1.0 + exit_slippage) if (current_price == tp or current_price is None) else current_price
+            self.close_trade(plan, exit_price=sim_exit, exit_reason="TAKE_PROFIT")
+            return {
+                "plan_id": plan_id,
+                "symbol": symbol,
+                "closed": True,
+                "exit_price": sim_exit,
+                "exit_reason": "TAKE_PROFIT",
+            }
+
+        # 2. Trailing Stop / Stop Loss Check
+        if direction == "LONG" and current_stop > 0 and current_price <= current_stop:
+            sim_exit = current_stop * (1.0 - exit_slippage) if (current_price == current_stop or current_price is None) else current_price
+            self.close_trade(plan, exit_price=sim_exit, exit_reason="TRAILING_STOP")
+            return {
+                "plan_id": plan_id,
+                "symbol": symbol,
+                "closed": True,
+                "exit_price": sim_exit,
                 "exit_reason": "TRAILING_STOP",
             }
         elif direction == "SHORT" and current_stop > 0 and current_price >= current_stop:
-            self.close_trade(plan, exit_price=current_price, exit_reason="TRAILING_STOP")
+            sim_exit = current_stop * (1.0 + exit_slippage) if (current_price == current_stop or current_price is None) else current_price
+            self.close_trade(plan, exit_price=sim_exit, exit_reason="TRAILING_STOP")
             return {
                 "plan_id": plan_id,
                 "symbol": symbol,
                 "closed": True,
-                "exit_price": current_price,
+                "exit_price": sim_exit,
                 "exit_reason": "TRAILING_STOP",
             }
 

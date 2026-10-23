@@ -1,0 +1,39 @@
+{
+  "personal_details": {
+    "legal_first_name": "Muhammed",
+    "legal_last_name": "Ansheed",
+    "email": "chefanshid@gmail.com",
+    "phone": "+971 56 950 3813",
+    "current_residence": "Dubai, United Arab Emirates",
+    "citizenship_eligibility": "Available for immediate visa transfer to Qatar, Oman, Maldives, or Maritime Seafarer Contract"
+  },
+  "culinary_credentials": {
+    "primary_role_title": "Demi Chef de Partie",
+    "secondary_executive_role": "Executive Chef / Culinary Brand Founder (Bayt Al Bites)",
+    "years_experience": 7,
+    "michelin_experience": "Yes - Sand & Koal (Michelin Guide-listed), Emirates Palace Mandarin Oriental, Abu Dhabi",
+    "5_star_luxury_resort": "Yes - Jumeirah Beach Hotel (Jumeirah Group), Dubai",
+    "haccp_certification": "HACCP Level 3 Certified (100% compliance audit record)",
+    "peak_buffet_covers": 900,
+    "butchery_volume_kg_daily": "80-100 kg/day central butchery with zero wastage",
+    "food_cost_achieved": "18%",
+    "specialties": [
+      "Hot Kitchen Line Production",
+      "Cold Larder & Garde Manger",
+      "Central Butchery & Whole-Animal Fabrication",
+      "Mandi Slow-Cooked Pit Cookery",
+      "Michelin Fine Dining Plating & Standardization"
+    ]
+  },
+  "target_regions": [
+    "Qatar (Doha Luxury Hotels & Resorts)",
+    "Oman (Muscat Luxury 5-Star Properties)",
+    "Maldives (Ultra-Luxury Private Island Resorts)",
+    "Ultra-Luxury Cruise Lines (Royal Caribbean, Silversea, Ritz-Carlton Yacht Collection)"
+  ],
+  "digital_assets": {
+    "portfolio_url": "https://chefanshid-web.github.io/chef-ansheed-website/",
+    "linkedin_profile": "https://www.linkedin.com/in/chef-anshid-b89356322",
+    "haccp_credential_id": "HACCP Level 3 Active"
+  }
+}

@@ -59,6 +59,17 @@ class SystemConfig:
     ATR_MULTIPLIER_FOR_STOP: float = float(os.getenv('ATR_MULTIPLIER_FOR_STOP', 1.5))
     ATR_MULTIPLIER_FOR_TRAIL: float = float(os.getenv('ATR_MULTIPLIER_FOR_TRAIL', 3.0))
 
+    # Real-World Execution Friction & Fee Constants
+    maker_fee_pct: float = float(os.getenv('MAKER_FEE_PCT', 0.0002))
+    taker_fee_pct: float = float(os.getenv('TAKER_FEE_PCT', 0.0005))
+    slippage_pct: float = float(os.getenv('SLIPPAGE_PCT', 0.0005))
+    funding_rate_buffer: float = float(os.getenv('FUNDING_RATE_BUFFER', 0.0001))
+
+    MAKER_FEE_PCT: float = float(os.getenv('MAKER_FEE_PCT', 0.0002))
+    TAKER_FEE_PCT: float = float(os.getenv('TAKER_FEE_PCT', 0.0005))
+    SLIPPAGE_PCT: float = float(os.getenv('SLIPPAGE_PCT', 0.0005))
+    FUNDING_RATE_BUFFER: float = float(os.getenv('FUNDING_RATE_BUFFER', 0.0001))
+
 config = SystemConfig()
 
 
@@ -71,4 +82,10 @@ RISK_PER_TRADE_PERCENT = float(os.getenv('RISK_PER_TRADE_PERCENT', 0.01))
 ATR_MULTIPLIER_FOR_STOP = float(os.getenv('ATR_MULTIPLIER_FOR_STOP', 1.5))
 ATR_MULTIPLIER_FOR_TRAIL = float(os.getenv('ATR_MULTIPLIER_FOR_TRAIL', 3.0))
 ACCOUNT_BALANCE_USD = float(os.getenv('ACCOUNT_BALANCE_USD', 100.0))
+
+# Real-World Execution Friction & Fee Constants
+MAKER_FEE_PCT = float(os.getenv('MAKER_FEE_PCT', 0.0002))
+TAKER_FEE_PCT = float(os.getenv('TAKER_FEE_PCT', 0.0005))
+SLIPPAGE_PCT = float(os.getenv('SLIPPAGE_PCT', 0.0005))
+FUNDING_RATE_BUFFER = float(os.getenv('FUNDING_RATE_BUFFER', 0.0001))
 

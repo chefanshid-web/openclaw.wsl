@@ -183,3 +183,175 @@ class TestBacktestMetrics:
         assert pos.is_rejected is True
         assert "below exchange minimum order size" in pos.rejection_reason
         assert pos.total_value < 5.0
+
+    def test_fee_and_friction_constants(self):
+        """
+        Task 1: Verify fee and friction constants in src/config.py
+        - MAKER_FEE_PCT = 0.0002 (0.02%)
+        - TAKER_FEE_PCT = 0.0005 (0.05%)
+        - SLIPPAGE_PCT = 0.0005 (0.05% average)
+        - FUNDING_RATE_BUFFER = 0.0001 (0.01% per 8 hours)
+        """
+        from src import config
+
+        assert hasattr(config, "MAKER_FEE_PCT")
+        assert config.MAKER_FEE_PCT == 0.0002
+        assert hasattr(config, "TAKER_FEE_PCT")
+        assert config.TAKER_FEE_PCT == 0.0005
+        assert hasattr(config, "SLIPPAGE_PCT")
+        assert config.SLIPPAGE_PCT == 0.0005
+        assert hasattr(config, "FUNDING_RATE_BUFFER")
+        assert config.FUNDING_RATE_BUFFER == 0.0001
+
+    def test_honest_fill_entry_slippage_and_fee_deduction(self):
+        """
+        Task 2 & 3: In fill_triggered_plan():
+        - Calculate entry_slippage = random.uniform(0, 0.001)
+        - fill_price = entry_price * (1 + entry_slippage) for LONG, (1 - entry_slippage) for SHORT
+        - entry_fee = (fill_price * quantity) * MAKER_FEE_PCT
+        - Deduct entry_fee from simulated balance
+        - PAPER_FILL signal log includes gross_pnl, entry_fee, exit_fee, slippage_cost, net_pnl
+        """
+        from unittest.mock import MagicMock
+        from datetime import datetime, timezone
+        from src.paper_executor import PaperExecutor
+
+        mock_db = MagicMock()
+        mock_table = mock_db.client.table.return_value
+        mock_table.select.return_value.eq.return_value.limit.return_value.execute.return_value.data = [
+            {"plan_metadata": {}}
+        ]
+        mock_table.update.return_value.eq.return_value.eq.return_value.execute.return_value.data = [
+            {"id": "plan-honest-1", "status": "FILLED"}
+        ]
+
+        executor = PaperExecutor(db_manager=mock_db)
+        initial_balance = executor.simulated_balance
+
+        plan = {
+            "id": "plan-honest-1",
+            "symbol": "BTC/USDT:USDT",
+            "direction": "LONG",
+            "entry_price": 50000.0,
+            "atr": 1000.0,
+            "stop_loss": 48500.0,
+            "take_profit": 53000.0,
+            "plan_metadata": {
+                "triggered_at": datetime.now(timezone.utc).isoformat(),
+                "atr": 1000.0,
+            }
+        }
+
+        res = executor.fill_triggered_plan(plan)
+        assert res is True
+
+        # Check update payload
+        update_call = mock_table.update.call_args[0][0]
+        meta = update_call["plan_metadata"]
+
+        assert "fill_price" in meta
+        # For LONG, fill_price >= entry_price
+        assert meta["fill_price"] >= 50000.0
+        assert meta["fill_price"] <= 50000.0 * 1.0015
+
+        assert "entry_fee" in meta
+        assert meta["entry_fee"] > 0.0
+        # Simulated balance deducted by entry_fee
+        assert executor.simulated_balance == initial_balance - meta["entry_fee"]
+
+        # Check PAPER_FILL signal audit log
+        mock_db.log_signal.assert_called_once()
+        sig_call = mock_db.log_signal.call_args[1]
+        assert sig_call["signal_type"] == "PAPER_FILL"
+        sig_meta = sig_call["metadata"]
+
+        assert "gross_pnl" in sig_meta
+        assert sig_meta["gross_pnl"] == 0.0
+        assert "entry_fee" in sig_meta
+        assert sig_meta["entry_fee"] == meta["entry_fee"]
+        assert "exit_fee" in sig_meta
+        assert sig_meta["exit_fee"] == 0.0
+        assert "slippage_cost" in sig_meta
+        assert sig_meta["slippage_cost"] >= 0.0
+        assert "net_pnl" in sig_meta
+        assert sig_meta["net_pnl"] == -meta["entry_fee"]
+
+    def test_honest_exit_slippage_fee_and_net_pnl(self):
+        """
+        Task 2 & 3: In close_trade():
+        - exit_slippage in uniform(0, 0.001)
+        - exit_price = stop_loss * (1 - exit_slippage) for LONG, (1 + exit_slippage) for SHORT
+        - exit_fee = (exit_price * quantity) * TAKER_FEE_PCT
+        - Deduct exit_fee from simulated balance
+        - net_pnl = gross_pnl - entry_fee - exit_fee
+        """
+        from unittest.mock import MagicMock
+        from datetime import datetime, timezone
+        from src.paper_executor import PaperExecutor
+
+        mock_db = MagicMock()
+        mock_table = mock_db.client.table.return_value
+
+        executor = PaperExecutor(db_manager=mock_db)
+        starting_bal = executor.simulated_balance
+
+        plan = {
+            "id": "plan-exit-honest",
+            "symbol": "BTC/USDT:USDT",
+            "direction": "LONG",
+            "entry_price": 50000.0,
+            "stop_loss": 49000.0,
+            "take_profit": 53000.0,
+            "position_size": 0.1,
+            "plan_metadata": {
+                "fill_price": 50020.0,
+                "position_size": 0.1,
+                "entry_fee": 1.00,
+                "slippage_cost": 2.00,
+            }
+        }
+
+        # Simulate that entry_fee was already deducted
+        executor.simulated_balance -= 1.00
+
+        # Close trade via stop loss
+        res = executor.close_trade(plan, exit_reason="STOP_LOSS")
+        assert res is True
+
+        # Check PAPER_EXIT signal log
+        exit_sig = mock_db.log_signal.call_args[1]
+        assert exit_sig["signal_type"] == "PAPER_EXIT"
+        exit_meta = exit_sig["metadata"]
+
+        assert "gross_pnl" in exit_meta
+        assert "entry_fee" in exit_meta
+        assert "exit_fee" in exit_meta
+        assert "slippage_cost" in exit_meta
+        assert "net_pnl" in exit_meta
+
+        # For LONG, exit price is <= 49000.0 (stop_loss * (1 - exit_slippage))
+        assert exit_meta["exit_price"] <= 49000.0
+        assert exit_meta["exit_fee"] > 0.0
+        # Net PnL must equal gross_pnl - entry_fee - exit_fee
+        expected_net = round(exit_meta["gross_pnl"] - exit_meta["entry_fee"] - exit_meta["exit_fee"], 4)
+        assert pytest.approx(exit_meta["net_pnl"], 0.001) == expected_net
+
+        # Check that simulated balance change across the trade is exactly net_pnl
+        total_balance_change = executor.simulated_balance - starting_bal
+        assert pytest.approx(total_balance_change, 0.001) == exit_meta["net_pnl"]
+
+    def test_dashboard_pnl_breakdown(self):
+        """
+        Task 4: Validates that src/dashboard.py includes the Total PnL breakdown:
+        Gross Profit, Fees Paid, Slippage Cost, and Net Profit.
+        """
+        from pathlib import Path
+        dash_file = Path(__file__).resolve().parent.parent / "src" / "dashboard.py"
+        assert dash_file.exists()
+        content = dash_file.read_text(encoding="utf-8")
+
+        assert "Gross Profit" in content
+        assert "Fees Paid" in content
+        assert "Slippage Cost" in content
+        assert "Net Profit" in content
+        assert "get_pnl_breakdown" in content

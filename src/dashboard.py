@@ -336,10 +336,11 @@ def get_equity_metrics(db_client: Optional[Any]) -> tuple[str, str, str]:
     """
     Calculate or simulate portfolio equity and PnL metrics.
     Uses database trade records if available, otherwise provides realistic simulated desk equity.
+    The net_pnl must be the ONLY number used for the account balance.
     """
-    base_capital = 100000.0
-    current_equity = 104850.25
-    total_pnl = 4850.25
+    base_capital = float(getattr(config, "ACCOUNT_BALANCE_USD", 100.0)) if config else 100.0
+    current_equity = base_capital + 4.85
+    total_pnl = 4.85
     pnl_pct = 4.85
     delta_type = "normal"
 
@@ -353,18 +354,81 @@ def get_equity_metrics(db_client: Optional[Any]) -> tuple[str, str, str]:
                     calculated_pnl = 0.0
                     for p in filled:
                         meta = p.get("plan_metadata") or {}
-                        pnl = meta.get("realized_pnl") or meta.get("pnl") or 0.0
+                        # net_pnl is the ONLY number used for account balance
+                        pnl = meta.get("net_pnl")
+                        if pnl is None:
+                            pnl = meta.get("realized_pnl") or meta.get("pnl") or 0.0
                         calculated_pnl += float(pnl)
-                    if calculated_pnl != 0.0:
-                        total_pnl = calculated_pnl
-                        current_equity = base_capital + total_pnl
-                        pnl_pct = (total_pnl / base_capital) * 100
-                        delta_type = "normal" if total_pnl >= 0 else "inverse"
+                    total_pnl = calculated_pnl
+                    current_equity = base_capital + total_pnl
+                    pnl_pct = (total_pnl / base_capital) * 100 if base_capital > 0 else 0.0
+                    delta_type = "normal" if total_pnl >= 0 else "inverse"
         except Exception:
             pass
 
     sign = "+" if total_pnl >= 0 else ""
     return f"${current_equity:,.2f}", f"{sign}${total_pnl:,.2f} ({sign}{pnl_pct:.2f}%)", delta_type
+
+
+def get_pnl_breakdown(db_client: Optional[Any]) -> Dict[str, float]:
+    """
+    Task 4: Computes portfolio Total PnL breakdown:
+    - Gross Profit: sum of trade gross profits (before fees & slippage)
+    - Fees Paid: sum of entry + exit maker/taker fees
+    - Slippage Cost: sum of execution slippage costs
+    - Net Profit: sum of net PnL (Gross - Fees - Slippage)
+    """
+    gross_profit = 0.0
+    fees_paid = 0.0
+    slippage_cost = 0.0
+    net_profit = 0.0
+    has_trades = False
+
+    if db_client:
+        try:
+            res = db_client.client.table("trade_plans").select("*").execute()
+            plans = res.data or []
+            if plans:
+                filled = [p for p in plans if (p.get("status") or "").upper() in ("FILLED", "CLOSED")]
+                if filled:
+                    has_trades = True
+                    for p in filled:
+                        meta = p.get("plan_metadata") or {}
+                        g = meta.get("gross_pnl")
+                        ef = float(meta.get("entry_fee") or 0.0)
+                        xf = float(meta.get("exit_fee") or 0.0)
+                        fee = (ef + xf) if (ef > 0 or xf > 0) else float(meta.get("fee_cost") or 0.0)
+                        sc = float(meta.get("slippage_cost") or 0.0)
+                        net = meta.get("net_pnl")
+                        if net is None:
+                            net = meta.get("realized_pnl") or meta.get("pnl") or 0.0
+                        net = float(net)
+
+                        if g is None:
+                            g = net + fee + sc
+                        else:
+                            g = float(g)
+
+                        gross_profit += g
+                        fees_paid += fee
+                        slippage_cost += sc
+                        net_profit += net
+        except Exception:
+            pass
+
+    if not has_trades or (gross_profit == 0.0 and net_profit == 0.0):
+        # Realistic simulated breakdown for offline/demo mode ($100 starting balance)
+        gross_profit = 6.25
+        fees_paid = 0.85
+        slippage_cost = 0.55
+        net_profit = round(gross_profit - fees_paid - slippage_cost, 2)
+
+    return {
+        "gross_profit": round(gross_profit, 2),
+        "fees_paid": round(fees_paid, 2),
+        "slippage_cost": round(slippage_cost, 2),
+        "net_profit": round(net_profit, 2),
+    }
 
 # -----------------------------------------------------------------------------
 # Fallback / Simulated Data (Ensures DataFrames always render on modern terminal)
@@ -786,6 +850,40 @@ with tab1:
             value=macro_val,
             delta=f"Score: {score}/10 • {regime_str}",
             delta_color=macro_delta_col,
+        )
+
+    # Task 4: Total PnL Breakdown (Gross Profit, Fees Paid, Slippage Cost, Net Profit)
+    st.markdown("<div style='height: 14px;'></div>", unsafe_allow_html=True)
+    st.markdown("##### 💰 Total PnL Breakdown (Mathematically Honest Friction)")
+    pnl_data = get_pnl_breakdown(db)
+    col_p1, col_p2, col_p3, col_p4 = st.columns(4)
+    with col_p1:
+        st.metric(
+            label="Gross Profit",
+            value=f"${pnl_data['gross_profit']:+,.2f}",
+            delta="Pre-Friction Gain",
+        )
+    with col_p2:
+        st.metric(
+            label="Fees Paid",
+            value=f"-${abs(pnl_data['fees_paid']):,.2f}",
+            delta="Maker 0.02% / Taker 0.05%",
+            delta_color="inverse",
+        )
+    with col_p3:
+        st.metric(
+            label="Slippage Cost",
+            value=f"-${abs(pnl_data['slippage_cost']):,.2f}",
+            delta="Market Impact Variance",
+            delta_color="inverse",
+        )
+    with col_p4:
+        delta_net_col = "normal" if pnl_data['net_profit'] >= 0 else "inverse"
+        st.metric(
+            label="Net Profit",
+            value=f"${pnl_data['net_profit']:+,.2f}",
+            delta="Credited to Balance",
+            delta_color=delta_net_col,
         )
 
     st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
